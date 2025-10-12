@@ -5,7 +5,7 @@ WIP for making my own clone of mugen
 SOME USEFUL Byte structure:
 
 
-
+´´´´
 /*--| SFF file structure
 |--------------------------------------------------*\
   Version 1.01
@@ -185,18 +185,6 @@ SFFv2 file structure:
 It is also important to note that the images are not saved in the PNG file they are turned into raw data and then compressed with algorithms.
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 /*--| SND file structure
 |--------------------------------------------------*\
   Version 1.01
@@ -241,6 +229,8 @@ Bytes
 24-27  File offset where TEXT data is located.                           [04]
 28-31  Length of TEXT data in bytes.                                     [04]
 32-63  Blank; can be used for comments.                                  [40]
+
+´´´´
 
 
 License:
