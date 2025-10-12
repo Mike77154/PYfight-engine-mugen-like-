@@ -29,12 +29,92 @@ SFFSubfile = collections.namedtuple("SFFSubfile", [
     "group","image","shared","raw","linked_index"
 ])
 
+def _b2i(b):
+    """Byte to int (Py2/3)."""
+    if isinstance(b, int):
+        return b
+    return ord(b)
+
+def _pcx_has_embedded_palette(raw_bytes):
+    """
+    Paleta embebida en PCX 8bpp: último bloque es 0x0C seguido de 768 bytes (RGB).
+    """
+    if not raw_bytes or len(raw_bytes) < 769:
+        return False
+    marker = raw_bytes[-769]
+    return _b2i(marker) == 12
+
+def _pcx_decode_8bpp(raw_bytes):
+    """
+    Decodificador PCX 8bpp RLE (planes=1).
+    Devuelve: (pixels_indexed_bytes, width, height, palette_or_None(list[768]))
+    Lanza ValueError si no es PCX 8bpp RLE válido.
+    """
+    if len(raw_bytes) < 128:
+        raise ValueError("PCX demasiado corto")
+    hdr = raw_bytes[:128]
+
+    manufacturer = _b2i(hdr[0:1])      # 0x0A
+    version      = _b2i(hdr[1:2])      # (no forzado)
+    encoding     = _b2i(hdr[2:3])      # 0x01 = RLE
+    bpp          = _b2i(hdr[3:4])      # 0x08 = 8bpp
+
+    if manufacturer != 0x0A or encoding != 0x01 or bpp != 8:
+        raise ValueError("PCX no 8bpp/RLE (manufacturer=%02X enc=%02X bpp=%d)" %
+                         (manufacturer, encoding, bpp))
+
+    x1 = struct.unpack("<H", hdr[4:6])[0]
+    y1 = struct.unpack("<H", hdr[6:8])[0]
+    x2 = struct.unpack("<H", hdr[8:10])[0]
+    y2 = struct.unpack("<H", hdr[10:12])[0]
+    w  = x2 - x1 + 1
+    h  = y2 - y1 + 1
+
+    # 65 = # of color planes (debe ser 1 para 8bpp plano)
+    planes = _b2i(hdr[65:66])
+    bpl    = struct.unpack("<H", hdr[66:68])[0]  # bytes per line (puede ser >= w por padding)
+
+    if planes != 1:
+        raise ValueError("PCX con %d planes (esperado 1)" % planes)
+
+    data = bytearray(raw_bytes[128:])
+    pal = None
+    # Si hay paleta embebida, retírala del stream comprimido antes de decodificar.
+    if _pcx_has_embedded_palette(raw_bytes[128:]):
+        pal_raw = data[-768:]
+        pal = [ _b2i(pal_raw[i:i+1]) for i in range(768) ]
+        # Quitamos marker (1) + 768 de paleta
+        del data[-769:]
+
+    out = bytearray(w*h)
+    i = 0  # cursor en data comprimida
+    for y in range(h):
+        x = 0
+        while x < w and i < len(data):
+            byte = _b2i(data[i]); i += 1
+            if byte >= 0xC0:
+                count = byte & 0x3F
+                if i >= len(data): break
+                val = _b2i(data[i]); i += 1
+                # Repite val 'count' veces (ojo: count ya es exacto, no inclusivo)
+                for _ in range(count):
+                    if x >= w: break
+                    out[y*w + x] = val
+                    x += 1
+            else:
+                out[y*w + x] = byte
+                x += 1
+        # El PCX puede tener padding hasta bpl; como decodificamos por x<w, lo ignoramos.
+
+    return bytes(out), w, h, pal
+
 class SFFv1(object):
     """
     Parser SFF v1 tolerante:
     - Intenta primero el modo 'lista enlazada' (usando offsets).
     - Si falla, usa un escaneo lineal desde 0x200 (y/o first_off).
     - Nunca crashea: acumula avisos en self.warnings.
+    - Ahora incluye decodificador real de PCX 8bpp RLE y extracción de paleta embebida.
     """
     def __init__(self, fp, tolerant=True, force_subhdr_size=None, max_linear_scan=20000000):
         if isinstance(fp, basestring):
@@ -75,7 +155,8 @@ class SFFv1(object):
 
         verhi, verlo, verlo2, verlo3 = struct.unpack("<BBBB", hdr[12:16])
 
-        # Detecta SFF v2 explícito
+        # Detecta SFF v2 explícito (M.U.G.E.N 1.0/1.1)
+        # v2 suele ser (verhi=1, verlo=1). En v1 comúnmente (verhi=0, verlo=1) o variantes antiguas.
         if (verhi, verlo) == (1, 1):
             raise ValueError("SFF v2 detectado (M.U.G.E.N 1.0/1.1). Este parser es SFF v1.")
 
@@ -86,7 +167,7 @@ class SFFv1(object):
         palette_type = struct.unpack("<B", hdr[32:33])[0]
         comments     = hdr[36:512]
 
-        # subheader size: usar override o caer a 32 si viene raro
+        # subheader size: usar override o caer a 32 si viene raro (28 también existe)
         if self.force_subhdr_size:
             subhdr_size = int(self.force_subhdr_size)
         else:
@@ -148,6 +229,7 @@ class SFFv1(object):
                 raw = self._read(length)
                 self._blob_cache[idx] = raw
             else:
+                # En v1 el "link" suele apuntar al sprite previo con mismo (group,image)
                 linked = self._find_owner_index(idx, group, image)
 
             self.subfiles.append(SFFSubfile(
@@ -267,7 +349,6 @@ class SFFv1(object):
                 # Avance total escaneado
                 scanned += step
 
-
             if idx > 0:
                 break  # ya parseamos algo útil; no probar más starts
 
@@ -287,6 +368,11 @@ class SFFv1(object):
             raise IOError("Offset fuera de rango (off=%d, need=%d, size=%d)" % (off, need, fsize))
 
     def _find_owner_index(self, idx, g, i):
+        """
+        Heurística v1 para links: busca hacia atrás el primer sprite con datos,
+        prefiriendo el que tenga el mismo (group,image). Si no hay coincidencia exacta,
+        usa el último con datos como 'best'.
+        """
         best = None
         for j in range(idx - 1, -1, -1):
             sf = self.subfiles[j]
@@ -317,21 +403,94 @@ class SFFv1(object):
         idx = self._resolve_index(key)
         return self._blob_cache.get(idx) if idx is not None else None
 
+    # ---------- NUEVO: decodificar PCX y obtener PIL.Image indexada ----------
+
+    def get_pil_indexed(self, key):
+        """
+        Devuelve (PIL.Image modo 'P', meta) si el blob es PCX 8bpp RLE válido.
+        Aplica paleta embebida si existe. Si no hay PIL, devuelve (None, None).
+        meta = {group,image,axis_x,axis_y,width,height}
+        """
+        if not PIL_OK:
+            return None, None
+
+        idx = self._resolve_index(key)
+        if idx is None:
+            return None, None
+        sf = self.subfiles[idx]
+        raw = self._blob_cache.get(idx)
+        if not raw:
+            return None, None
+
+        # Intentar decodificar PCX 8bpp RLE
+        try:
+            # bytearray para slicing eficiente
+            bb = bytearray(raw)
+            px, w, h, pal = _pcx_decode_8bpp(bb)
+            im = Image.frombytes('P', (w, h), px)
+            if pal and len(pal) >= 768:
+                im.putpalette(pal[:768])
+            meta = dict(group=sf.group, image=sf.image,
+                        axis_x=sf.axis_x, axis_y=sf.axis_y,
+                        width=w, height=h)
+            return im, meta
+        except Exception:
+            # Fallback: intentar abrir con PIL "como sea" (por si no era PCX real)
+            try:
+                bio = io.BytesIO(raw)
+                im = Image.open(bio); im.load()
+                if im.mode != 'P':
+                    im = im.convert('P')
+                meta = dict(group=sf.group, image=sf.image,
+                            axis_x=sf.axis_x, axis_y=sf.axis_y,
+                            width=im.size[0], height=im.size[1])
+                return im, meta
+            except Exception:
+                return None, None
+
+    # ------------------ Export ------------------
+
     def export_png(self, key, out_path):
+        """
+        Exporta como PNG. Si el blob es PCX 8bpp válido, lo decodifica y guarda con paleta.
+        Si no, intenta abrir con PIL directo. Si tampoco, escribe .pcx crudo.
+        """
         blob = self.get_blob(key)
         if not blob:
             raise ValueError("Sin datos para %r" % (key,))
+
+        base, _ = os.path.splitext(out_path)
+
+        # Ruta con PIL y decodificador PCX propio
         if PIL_OK:
-            bio = io.BytesIO(blob)
+            # 1) Intento PCX 8bpp con paleta embebida
             try:
-                im = Image.open(bio); im.load(); im.save(out_path, "PNG")
+                px, w, h, pal = _pcx_decode_8bpp(bytearray(blob))
+                im = Image.frombytes('P', (w, h), px)
+                if pal and len(pal) >= 768:
+                    im.putpalette(pal[:768])
+                im.save(out_path, "PNG")
                 return ("png", out_path)
             except Exception:
-                base,_ = os.path.splitext(out_path); pcx = base + ".pcx"
-                f = open(pcx,"wb"); f.write(blob); f.close()
+                pass
+            # 2) Fallback: abrir con PIL “como sea”
+            try:
+                bio = io.BytesIO(blob)
+                im = Image.open(bio); im.load()
+                # Si no es indexada, conviértela para uniformidad
+                if im.mode not in ('P', 'L', 'RGB', 'RGBA'):
+                    im = im.convert('P')
+                im.save(out_path, "PNG")
+                return ("png", out_path)
+            except Exception:
+                # cae a escribir como .pcx crudo
+                pcx = base + ".pcx"
+                f = open(pcx, "wb"); f.write(blob); f.close()
                 return ("pcx-raw", pcx)
-        base,_ = os.path.splitext(out_path); pcx = base + ".pcx"
-        f = open(pcx,"wb"); f.write(blob); f.close()
+
+        # Sin PIL: escribe crudo a .pcx
+        pcx = base + ".pcx"
+        f = open(pcx, "wb"); f.write(blob); f.close()
         return ("pcx-raw", pcx)
 
     def export_all(self, out_dir):
