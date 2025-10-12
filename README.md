@@ -6,6 +6,10 @@ SOME USEFUL Byte structure:
 
 
 ´´´´
+
+
+
+
 /*--| SFF file structure
 |--------------------------------------------------*\
   Version 1.01
@@ -229,6 +233,9 @@ Bytes
 24-27  File offset where TEXT data is located.                           [04]
 28-31  Length of TEXT data in bytes.                                     [04]
 32-63  Blank; can be used for comments.                                  [40]
+
+
+
 
 ´´´´
 
